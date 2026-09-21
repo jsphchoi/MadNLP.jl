@@ -23,5 +23,13 @@ solve!
 
 ```
 
+Once `solve!` has converged, the sensitivity of the solution to the parameters
+of the model is available:
+
+```@docs
+sensitivity
+sensitivity_result
+```
+
 Users can also define a termination criteria by using the `intermediate_callback` solver option.
 Besides termination, this is also useful for accessing the internal state of the solver and custom logging.
