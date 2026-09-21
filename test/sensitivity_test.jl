@@ -4,20 +4,20 @@ using LinearAlgebra
 using MadNLPTests
 using Random
 
-# TODO (REVIEW) Convex QP with constant Hessian P and Jacobian A, so the last KKT matrix has W = P and J = A.
+# Convex QP with constant Hessian P and Jacobian A, so the last KKT matrix has W = P and J = A.
 function _solve_qp(; n=10, m=5, fixed_variables=Int[], equality_cons=[1, 3], kwargs...)
     nlp = MadNLPTests.DenseDummyQP(zeros(n); m=m, fixed_variables=fixed_variables, equality_cons=equality_cons)
-    solver = MadNLPSolver(nlp; print_level=MadNLP.ERROR, kwargs...)
+    solver = MadNLPSolver(nlp; print_level=MadNLP.ERROR, tol=1e-8, kwargs...)
     stats = MadNLP.solve!(solver)
     return nlp, solver, stats
 end
 
-# TODO (REVIEW) Residuals of M d = p with the P and A of the QP: P dx + Aᵀ dy - dzl + dzu - px and A dx - py.
+# Residuals of M d = p with the P and A of the QP: P dx + Aᵀ dy - dzl + dzu - px and A dx - py.
 function _kkt_residuals(nlp, d, px, py)
     return nlp.P * d.dx .+ nlp.A' * d.dy .- d.dzl .+ d.dzu .- px, nlp.A * d.dx .- py
 end
 
-# TODO (REVIEW) Model implementing the parameter protocol of `sensitivity` around another model.
+# Model implementing the parameter protocol of `sensitivity` around another model.
 struct ParametricModel{T, M} <: NLPModels.AbstractNLPModel{T, Vector{T}}
     meta::NLPModels.NLPModelMeta{T, Vector{T}}
     counters::NLPModels.Counters
@@ -78,7 +78,7 @@ end
     Random.seed!(1)
     Hxθ, Jθ = randn(n, k), randn(m, k)
     nlp = ParametricModel(MadNLPTests.DenseDummyQP(zeros(n); m=m, equality_cons=[1, 3]), [0.5, -1.0, 2.0], Hxθ, Jθ)
-    solver = MadNLPSolver(nlp; print_level=MadNLP.ERROR, sparse_options...)
+    solver = MadNLPSolver(nlp; print_level=MadNLP.ERROR, tol=1e-8, sparse_options...)
     MadNLP.solve!(solver)
     s = MadNLP.sensitivity(solver, Hxθ, Jθ)
     @test s == MadNLP.backsolve_kkt!(solver, -Hxθ, -Jθ)
@@ -93,7 +93,7 @@ end
     θ0, θnew = [0.5, -1.0, 2.0], [0.6, -1.2, 2.3]
     dθ = θnew .- θ0
     nlp = ParametricModel(MadNLPTests.DenseDummyQP(zeros(n); m=m, equality_cons=[1, 3]), copy(θ0), Hxθ, Jθ)
-    solver = MadNLPSolver(nlp; print_level=MadNLP.ERROR, sparse_options...)
+    solver = MadNLPSolver(nlp; print_level=MadNLP.ERROR, tol=1e-8, sparse_options...)
     stats = MadNLP.solve!(solver)
     s = MadNLP.sensitivity(solver, Hxθ, Jθ)
 
