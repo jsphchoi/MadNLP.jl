@@ -1,23 +1,35 @@
 using Test
 using NLPModels
+using ParametricNLPModels
 using LinearAlgebra
 using MadNLPTests
 using Random
 
-# Convex QP with constant Hessian P and Jacobian A, so the last KKT matrix has W = P and J = A.
-function _solve_qp(; n=10, m=5, fixed_variables=Int[], equality_cons=[1, 3], kwargs...)
+# Convex QP with constant Hessian P and Jacobian A
+function _solve_QP(; n=10, m=5, fixed_variables=Int[], equality_cons=[1, 3], kwargs...)
     nlp = MadNLPTests.DenseDummyQP(zeros(n); m=m, fixed_variables=fixed_variables, equality_cons=equality_cons)
     solver = MadNLPSolver(nlp; print_level=MadNLP.ERROR, tol=1e-8, kwargs...)
     stats = MadNLP.solve!(solver)
     return nlp, solver, stats
 end
 
-# Residuals of M d = p with the P and A of the QP: P dx + Aᵀ dy - dzl + dzu - px and A dx - py.
-function _kkt_residuals(nlp, d, px, py)
-    return nlp.P * d.dx .+ nlp.A' * d.dy .- d.dzl .+ d.dzu .- px, nlp.A * d.dx .- py
+# Residual [rx; ry; rzl; rzu] := M d - p, with the Hessian P and Jacobian A of the QP
+# and the variable bounds rows equal to zl, zu, x - l, u - x
+function _kkt_residuals(solver, d, p)
+    nlp, cb, kkt = MadNLP.get_nlp(solver), MadNLP.get_cb(solver), MadNLP.get_kkt(solver)
+    n, m = nlp.meta.nvar, nlp.meta.ncon
+    px, py, pzl, pzu = p[1:n, :], p[n .+ (1:m), :], p[n + m .+ (1:n), :], p[2n + m .+ (1:n), :]
+    rx = nlp.P * d.dx .+ nlp.A' * d.dy .- d.dzl .+ d.dzu .- px
+    ry = nlp.A * d.dx .- py
+    tomodel = cb isa MadNLP.SparseCallback && cb.fixed_handler isa MadNLP.MakeParameter ? cb.fixed_handler.free : 1:n
+    il = findall(<=(length(tomodel)), kkt.ind_lb); vl = tomodel[kkt.ind_lb[il]]
+    iu = findall(<=(length(tomodel)), kkt.ind_ub); vu = tomodel[kkt.ind_ub[iu]]
+    rzl = kkt.l_lower[il] ./ cb.obj_scale[] .* d.dx[vl, :] .- kkt.l_diag[il] .* d.dzl[vl, :] .- pzl[vl, :]
+    rzu = .-kkt.u_lower[iu] ./ cb.obj_scale[] .* d.dx[vu, :] .- kkt.u_diag[iu] .* d.dzu[vu, :] .- pzu[vu, :]
+    return rx, ry, rzl, rzu
 end
 
-# Model implementing the parameter protocol of `sensitivity` around another model.
+# Test model implementing the ParametricNLPModels interface with constant Hxθ and Jθ
 struct ParametricModel{T, M} <: NLPModels.AbstractNLPModel{T, Vector{T}}
     meta::NLPModels.NLPModelMeta{T, Vector{T}}
     counters::NLPModels.Counters
@@ -36,11 +48,19 @@ NLPModels.jac_coord!(nlp::ParametricModel, x::AbstractVector, vals::AbstractVect
 NLPModels.hess_structure!(nlp::ParametricModel, rows::AbstractVector, cols::AbstractVector) = NLPModels.hess_structure!(nlp.inner, rows, cols)
 NLPModels.hess_coord!(nlp::ParametricModel, x::AbstractVector, y::AbstractVector, vals::AbstractVector; obj_weight=1.0) =
     NLPModels.hess_coord!(nlp.inner, x, y, vals; obj_weight=obj_weight)
-struct Θ end
-(nlp::ParametricModel)(x, y) = (nlp.Hxθ, nlp.Jθ)
-(nlp::ParametricModel)(::Θ, x, y) = nlp(x, y)
-Base.getindex(nlp::ParametricModel, ::Θ) = nlp.θ
-Base.setindex!(nlp::ParametricModel, v, ::Θ) = (nlp.θ .= v; nlp)
+ParametricNLPModels.get_par_meta(nlp::ParametricModel) =
+    ParametricNLPModelMeta(; npar=length(nlp.θ), nnzj_par=length(nlp.Jθ), nnzh_par=length(nlp.Hxθ), grad_par_available=false)
+ParametricNLPModels.jac_par_structure!(nlp::ParametricModel, rows, cols) = _dense_structure!(nlp.Jθ, rows, cols)
+ParametricNLPModels.jac_par_coord!(nlp::ParametricModel, x, vals) = copyto!(vals, nlp.Jθ)
+ParametricNLPModels.hess_par_structure!(nlp::ParametricModel, rows, cols) = _dense_structure!(nlp.Hxθ, rows, cols)
+ParametricNLPModels.hess_par_coord!(nlp::ParametricModel, x, y, vals; obj_weight=1.0) = copyto!(vals, nlp.Hxθ)
+
+function _dense_structure!(A, rows, cols)
+    for (k, I) in enumerate(CartesianIndices(A))
+        rows[k], cols[k] = Tuple(I)
+    end
+    return rows, cols
+end
 
 sparse_options = Dict{Symbol, Any}(
     :callback=>MadNLP.SparseCallback,
@@ -55,7 +75,7 @@ dense_options = Dict{Symbol, Any}(
 @testset "Sensitivity: backsolve_kkt!" begin
     n, m, eq = 10, 5, [1, 3]
     Random.seed!(1)
-    px, py = randn(n, 2), randn(m, 2)
+    p = randn(3n + m, 2)
 
     @testset "$name" for (name, options, fixed) in [
         ("sparse", sparse_options, Int[]),
@@ -63,12 +83,19 @@ dense_options = Dict{Symbol, Any}(
         ("sparse + fixed variables", sparse_options, [9, 10]),
         ("dense + fixed variables", dense_options, [9, 10]),
     ]
-        nlp, solver, stats = _solve_qp(; n=n, m=m, fixed_variables=fixed, equality_cons=eq, options...)
-        d = MadNLP.backsolve_kkt!(solver, px, py)
+        nlp, solver, stats = _solve_QP(; n=n, m=m, fixed_variables=fixed, equality_cons=eq, options...)
+        d = MadNLP.backsolve_kkt!(solver, p)
+        dvec = MadNLP.backsolve_kkt!(solver, p[:, 1])
+        @test dvec.dx == d.dx[:, 1] && dvec.dy == d.dy[:, 1] && dvec.dzl == d.dzl[:, 1] && dvec.dzu == d.dzu[:, 1]
+        @test MadNLP.backsolve_kkt!(solver, p[1:n + m, :]) == MadNLP.backsolve_kkt!(solver, [p[1:n + m, :]; zeros(2n, 2)])
+        @test_throws ArgumentError MadNLP.backsolve_kkt!(solver, zeros(2n + m, 2))
         free = setdiff(1:n, fixed)
-        resx, resy = _kkt_residuals(nlp, d, px, py)
-        @test norm(resx[free, :], Inf) <= 1e-6
-        @test norm(resy[eq, :], Inf) <= 1e-6
+        rx, ry, rzl, rzu = _kkt_residuals(solver, d, p)
+        @test norm(rx[free, :], Inf) <= 1e-6
+        @test norm(ry[eq, :], Inf) <= 1e-6
+        @test size(rzl, 1) == size(rzu, 1) == length(free)
+        @test norm(rzl, Inf) <= 1e-6
+        @test norm(rzu, Inf) <= 1e-6
         @test iszero(d.dx[fixed, :]) && iszero(d.dzl[fixed, :]) && iszero(d.dzu[fixed, :])
     end
 end
@@ -81,36 +108,13 @@ end
     solver = MadNLPSolver(nlp; print_level=MadNLP.ERROR, tol=1e-8, sparse_options...)
     MadNLP.solve!(solver)
     s = MadNLP.sensitivity(solver, Hxθ, Jθ)
-    @test s == MadNLP.backsolve_kkt!(solver, -Hxθ, -Jθ)
+    @test s == MadNLP.backsolve_kkt!(solver, -[Hxθ; Jθ])
     @test MadNLP.sensitivity(solver) == s
-    @test MadNLP.sensitivity(solver, Θ()) == s
-end
-
-@testset "Sensitivity: sensitivity_result" begin
-    n, m, k = 10, 5, 3
-    Random.seed!(1)
-    Hxθ, Jθ = randn(n, k), randn(m, k)
-    θ0, θnew = [0.5, -1.0, 2.0], [0.6, -1.2, 2.3]
-    dθ = θnew .- θ0
-    nlp = ParametricModel(MadNLPTests.DenseDummyQP(zeros(n); m=m, equality_cons=[1, 3]), copy(θ0), Hxθ, Jθ)
-    solver = MadNLPSolver(nlp; print_level=MadNLP.ERROR, tol=1e-8, sparse_options...)
-    stats = MadNLP.solve!(solver)
-    s = MadNLP.sensitivity(solver, Hxθ, Jθ)
-
-    updated = MadNLP.sensitivity_result(solver, Hxθ, Jθ, dθ)
-    @test updated.solution == stats.solution .+ s.dx * dθ
-    @test updated.multipliers == stats.multipliers .+ s.dy * dθ
-    @test updated.multipliers_L == stats.multipliers_L .+ s.dzl * dθ
-    @test updated.multipliers_U == stats.multipliers_U .+ s.dzu * dθ
-    @test updated.objective == NLPModels.obj(nlp, updated.solution)
-    @test updated.constraints == NLPModels.cons(nlp, updated.solution)
-
-    @test MadNLP.sensitivity_result(solver, Θ(), θnew).solution == updated.solution
-    @test nlp[Θ()] == θ0
-    MadNLP.sensitivity_result(solver, Θ(), θnew; restore_parameter=false)
-    @test nlp[Θ()] == θnew
-
-    exact = MadNLP.sensitivity_result(solver, Hxθ, Jθ, zeros(k); recompute_residuals=true)
-    @test exact.primal_feas <= 1e-6
-    @test exact.dual_feas <= 1e-6
+    dθ = [0.1, -0.2, 0.3]
+    sd = MadNLP.sensitivity(solver, dθ)
+    @test sd.dx ≈ s.dx * dθ
+    @test sd.dy ≈ s.dy * dθ
+    @test sd.dzl ≈ s.dzl * dθ
+    @test sd.dzu ≈ s.dzu * dθ
+    @test all(map(≈, MadNLP.sensitivity(solver, Hxθ, Jθ, dθ), sd))
 end

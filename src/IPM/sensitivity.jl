@@ -1,31 +1,50 @@
-# Parametric sensitivity ds/dp = -M^-1*N_p, M is KKT system and N_p = [d^2L/dxdp; dc/dp; 0; 0]
+# Parametric sensitivity ds/dθ = -M^-1 * N_θ
+# where M is the KKT system and N_θ = [∂²L/∂x∂θ; ∂c/∂θ; 0; 0]
 """
-    backsolve_kkt!(solver::AbstractMadNLPSolver, px::AbstractMatrix, py::AbstractMatrix)
+    backsolve_kkt!(solver::AbstractMadNLPSolver, p::AbstractMatrix)
+    backsolve_kkt!(solver::AbstractMadNLPSolver, p::AbstractVector)
 
-Solves `M d = p` where `p = (px, py, 0, 0)` and `M` is last KKT matrix factorized by [`solve!`](@ref).
-Returns `d = (; dx, dy, dzl, dzu)`.
+Solves `M d = p` where `M` is the last KKT matrix factorized by [`solve!`](@ref).
+Returns a NamedTuple `d = (; dx, dy, dzl, dzu)`.
 
-- `px`: variable block, `nvar × k`
-- `py`: constraint block, `ncon × k`
+- `p`: `[px; py; pzl; pzu]` or `[px; py]` with `pzl = pzu = 0`
 """
-function backsolve_kkt!(solver::AbstractMadNLPSolver{T}, px::AbstractMatrix, py::AbstractMatrix) where T
-    get_status(solver) in (SOLVE_SUCCEEDED, SOLVED_TO_ACCEPTABLE_LEVEL) ||
+function backsolve_kkt!(solver::AbstractMadNLPSolver{T}, p::AbstractMatrix) where T
+    if !(get_status(solver) in (SOLVE_SUCCEEDED, SOLVED_TO_ACCEPTABLE_LEVEL))
         error("backsolve_kkt! requires a solver on which solve! has converged")
-    nlp, cb, kkt = get_nlp(solver), get_cb(solver), get_kkt(solver)
-    nvar, ncon, k = get_nvar(nlp), get_ncon(nlp), size(px, 2)
-    size(px, 1) == nvar || throw(ArgumentError("px must be nvar × k"))
-    size(py) == (ncon, k) || throw(ArgumentError("py must be ncon × k"))
+    end
 
-    p, d, w, zbuf = get_p(solver), get_d(solver), get__w4(solver), primal(get__w1(solver))
+    nlp, cb, kkt = get_nlp(solver), get_cb(solver), get_kkt(solver)
+    nvar, ncon, k = get_nvar(nlp), get_ncon(nlp), size(p, 2)
+    if !(size(p, 1) in (nvar + ncon, 3nvar + ncon))
+        throw(ArgumentError("p must be (nvar + ncon) × k or (3nvar + ncon) × k"))
+    end
+
+    rhs, d, w, zbuf = get_p(solver), get_d(solver), get__w4(solver), primal(get__w1(solver))
     nx = length(variable(get_x(solver)))
     ifree, ufree = _free_indices(cb)
+
+    # rows of p = [px; py] or [px; py; pzl; pzu], the x and z blocks at the free variables
+    ind_px, ind_py = ufree, nvar .+ (1:ncon)
+    ind_pzl, ind_pzu = nvar + ncon .+ ufree, 2nvar + ncon .+ ufree
     x0 = get_x0(nlp)
     dx, dy, dzl, dzu = (fill!(similar(x0, n, k), zero(T)) for n in (nvar, ncon, nvar, nvar))
+
+    # Back-solve each column of p and unpack solution into dx, dy, dzl, dzu
     for j in 1:k
-        fill!(full(p), zero(T))
-        view(primal(p), ifree) .= view(px, ufree, j) .* (cb.obj_sign * cb.obj_scale[])
-        dual(p) .= view(py, :, j) .* cb.con_scale
-        solve_refine_wrapper!(d, solver, p, w) || error("KKT back-solve failed")
+        fill!(full(rhs), zero(T))
+        view(primal(rhs), ifree) .= view(p, ind_px, j) .* (cb.obj_sign * cb.obj_scale[])
+        dual(rhs) .= view(p, ind_py, j) .* cb.con_scale
+        if size(p, 1) == 3nvar + ncon
+            for (ind_pz, ind, rz, sign) in ((ind_pzl, kkt.ind_lb, dual_lb(rhs), one(T)), (ind_pzu, kkt.ind_ub, dual_ub(rhs), -one(T)))
+                fill!(zbuf, zero(T))
+                view(zbuf, ifree) .= view(p, ind_pz, j) .* (sign * cb.obj_scale[])
+                rz .= view(zbuf, ind)
+            end
+        end
+        if !solve_refine_wrapper!(d, solver, rhs, w)
+            error("KKT back-solve failed")
+        end
         view(dx, ufree, j) .= view(primal(d), ifree)
         unpack_y!(view(dy, :, j), cb, dual(d))
         for (dz, ind, dzd) in ((dzl, kkt.ind_lb, dual_lb(d)), (dzu, kkt.ind_ub, dual_ub(d)))
@@ -34,89 +53,57 @@ function backsolve_kkt!(solver::AbstractMadNLPSolver{T}, px::AbstractMatrix, py:
             unpack_z!(view(dz, :, j), cb, view(zbuf, 1:nx))
         end
     end
+
+    # julia shorthand for NamedTuple, (a = a, b = b, ...) <=> (; a, b, ...)
     return (; dx, dy, dzl, dzu)
 end
+backsolve_kkt!(solver::AbstractMadNLPSolver, p::AbstractVector) = map(vec, backsolve_kkt!(solver, reshape(p, :, 1)))
 
-"""
-    sensitivity(solver::AbstractMadNLPSolver[, θ])
-    sensitivity(solver::AbstractMadNLPSolver, Hxθ::AbstractMatrix, Jθ::AbstractMatrix)
-
-Returns the first-order parametric sensitivity `(; dx, dy, dzl, dzu)/dθ` at the primal-dual solution.
-
-- `Hxθ`: `∂²L/∂x∂θ` at the solution, `nvar × nθ`
-- `Jθ`: `∂c/∂θ` at the solution, `ncon × nθ`
-"""
-sensitivity(solver::AbstractMadNLPSolver, Hxθ::AbstractMatrix, Jθ::AbstractMatrix) =
-    backsolve_kkt!(solver, .-Hxθ, .-Jθ)
-function sensitivity(solver::AbstractMadNLPSolver, θ...)
-    nlp, stats = get_nlp(solver), update!(MadNLPExecutionStats(solver), solver)
-    applicable(nlp, θ..., stats.solution, stats.multipliers) ||
-        throw(ArgumentError("the model does not provide nlp(x, y) or nlp(θ, x, y), Hxθ and Jθ required"))
-    return sensitivity(solver, nlp(θ..., stats.solution, stats.multipliers)...)
-end
-
-"""
-    sensitivity_result(solver::AbstractMadNLPSolver, θ, θnew; restore_parameter = true, recompute_residuals = false)
-    sensitivity_result(solver::AbstractMadNLPSolver, Hxθ::AbstractMatrix, Jθ::AbstractMatrix, dθ::AbstractVector; recompute_residuals = false)
-
-Returns the [`MadNLPExecutionStats`](@ref) at `θnew` from the first-order parametric sensitivity at `θ`.
-
-- `θ`: parameter block, accessed as `nlp[θ]`
-- `θnew`: new values of `θ`
-- `dθ`: `θnew - θ`, with the model already at `θnew`
-- `restore_parameter`: restore `nlp[θ]` after the call
-- `recompute_residuals`: recompute `primal_feas` and `dual_feas` at the new solution
-"""
-function sensitivity_result(solver::AbstractMadNLPSolver, θ, θnew; restore_parameter = true, recompute_residuals = false)
-    nlp = get_nlp(solver)
-    θ0 = copy(nlp[θ])
-    dθ = copyto!(similar(θ0), θnew) .- θ0
-    s = sensitivity(solver, θ)
-    nlp[θ] = θnew
-    try
-        return _sensitivity_result(solver, s, dθ, recompute_residuals)
-    finally
-        restore_parameter && (nlp[θ] = θ0)
-    end
-end
-sensitivity_result(solver::AbstractMadNLPSolver, Hxθ::AbstractMatrix, Jθ::AbstractMatrix, dθ::AbstractVector; recompute_residuals = false) =
-    _sensitivity_result(solver, sensitivity(solver, Hxθ, Jθ), dθ, recompute_residuals)
-
-function _sensitivity_result(solver, s, dθ, recompute_residuals)
-    nlp, stats = get_nlp(solver), update!(MadNLPExecutionStats(solver), solver)
-    stats.solution .+= s.dx * dθ
-    stats.multipliers .+= s.dy * dθ
-    stats.multipliers_L .+= s.dzl * dθ
-    stats.multipliers_U .+= s.dzu * dθ
-    stats.objective = NLPModels.obj(nlp, stats.solution)
-    get_ncon(nlp) > 0 && NLPModels.cons!(nlp, stats.solution, stats.constraints)
-    recompute_residuals && _residuals!(stats, nlp)
-    return stats
-end
-
-_violation(v, l, u) = max(maximum(l .- v; init = zero(eltype(v))), maximum(v .- u; init = zero(eltype(v))))
-function _residuals!(stats::MadNLPExecutionStats, nlp)
-    x, lvar, uvar = stats.solution, NLPModels.get_lvar(nlp), NLPModels.get_uvar(nlp)
-    stats.primal_feas = max(
-        _violation(x, lvar, uvar),
-        _violation(stats.constraints, NLPModels.get_lcon(nlp), NLPModels.get_ucon(nlp)),
-    )
-    r = similar(x)
-    NLPModels.grad!(nlp, x, r)
-    r .-= stats.multipliers_L
-    r .+= stats.multipliers_U
-    if get_ncon(nlp) > 0
-        jtv = similar(x)
-        NLPModels.jtprod!(nlp, x, stats.multipliers, jtv)
-        r .+= jtv
-    end
-    stats.dual_feas = maximum(abs, r .* (lvar .!= uvar); init = zero(eltype(r)))
-    return stats
-end
-
-# Positions of the free variables in `cb` and in `nlp`.
+# Indices of the free variables in `cb` and in `nlp`
 _free_indices(cb::AbstractCallback) = (1:get_nvar(cb.nlp), 1:get_nvar(cb.nlp))
 _free_indices(cb::SparseCallback{T, VT, VI, NLP, FH}) where {T, VT, VI, NLP, FH<:MakeParameter} =
     (1:length(cb.fixed_handler.free), cb.fixed_handler.free)
 _free_indices(cb::DenseCallback{T, VT, VI, NLP, FH}) where {T, VT, VI, NLP, FH<:MakeParameter} =
     (cb.fixed_handler.free, cb.fixed_handler.free)
+
+"""
+    sensitivity(solver::AbstractMadNLPSolver)
+    sensitivity(solver::AbstractMadNLPSolver, Hxθ::AbstractMatrix, Jθ::AbstractMatrix)
+
+Evaluates the parametric sensitivity jacobian `{dx, dy, dzl, dzu}/dθ` at the solution.
+Returns a NamedTuple `(; dx, dy, dzl, dzu)` of matrices with `nθ` columns.
+
+- `Hxθ`: `∂²L/∂x∂θ` at the solution, `nvar × nθ`
+- `Jθ`: `∂c/∂θ` at the solution, `ncon × nθ`
+"""
+sensitivity(solver::AbstractMadNLPSolver, Hxθ::AbstractMatrix, Jθ::AbstractMatrix) =
+    backsolve_kkt!(solver, -[Hxθ; Jθ])
+function sensitivity(solver::AbstractMadNLPSolver)
+    nlp, stats = get_nlp(solver), update!(MadNLPExecutionStats(solver), solver)
+    x, y, nθ = stats.solution, stats.multipliers, get_npar(nlp)
+    Hxθ = hess_par_dense!(nlp, x, y, similar(x, get_nvar(nlp), nθ))
+    Jθ = jac_par_dense!(nlp, x, similar(x, get_ncon(nlp), nθ))
+    return sensitivity(solver, Hxθ, Jθ)
+end
+
+"""
+    sensitivity(solver::AbstractMadNLPSolver, dθ::AbstractVector)
+    sensitivity(solver::AbstractMadNLPSolver, Hxθ::AbstractMatrix, Jθ::AbstractMatrix, dθ::AbstractVector)
+
+Evaluates the parametric sensitivity directional derivative `{dx, dy, dzl, dzu}/dθ * dθ` at the solution along `dθ`.
+Returns a NamedTuple `(; dx, dy, dzl, dzu)` of vectors.
+
+- `dθ`: direction in the parameters, `nθ`
+- `Hxθ`: `∂²L/∂x∂θ` at the solution, `nvar × nθ`
+- `Jθ`: `∂c/∂θ` at the solution, `ncon × nθ`
+"""
+sensitivity(solver::AbstractMadNLPSolver, Hxθ::AbstractMatrix, Jθ::AbstractMatrix, dθ::AbstractVector) =
+    backsolve_kkt!(solver, -[Hxθ * dθ; Jθ * dθ])
+function sensitivity(solver::AbstractMadNLPSolver, dθ::AbstractVector)
+    nlp, stats = get_nlp(solver), update!(MadNLPExecutionStats(solver), solver)
+    x, y = stats.solution, stats.multipliers
+    dθ = copyto!(similar(x, length(dθ)), dθ)
+    Hxθdθ = hprod_par(nlp, x, y, dθ)
+    Jθdθ = jprod_par(nlp, x, dθ)
+    return backsolve_kkt!(solver, -[Hxθdθ; Jθdθ])
+end
