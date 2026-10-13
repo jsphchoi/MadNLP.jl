@@ -23,11 +23,11 @@ solve!
 
 ```
 
-Once `solve!` has converged, the sensitivity of the solution to the parameters
-of a model implementing the [ParametricNLPModels.jl](https://github.com/madsuite-org/ParametricNLPModels.jl) interface is available:
-
+Once `solve!` has converged, the sensitivity of the solution to the parameters is available:
 ```@docs
-sensitivity
+sensitivity!
+sensitivity_jvp!
+sensitivity_vjp!
 ```
 
 Users can also define a termination criteria by using the `intermediate_callback` solver option.
